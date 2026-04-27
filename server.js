@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -8,165 +9,93 @@ app.use(cors({ origin: '*' }));
 app.options('*', cors());
 app.use(express.json());
 
-const JOGADORES_TIME = [
-  'IMB_And-', 'IMB_Gust', 'IMB_VnC', 'IMB_Shell',
-  'IMB_Bimba', 'IMB_Gabkill', 'IMB_Bentoo', 'IMB_Dvk-',
-];
+// Banco de dados PostgreSQL
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+});
 
-const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
-  'Accept': 'application/json, text/plain, */*',
-  'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-  'Referer': 'https://r6.tracker.network/',
-  'Origin': 'https://r6.tracker.network',
-  'X-Warden-Challenge-Passed': 'true',
-  'Sec-Ch-Ua': '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
-  'Sec-Ch-Ua-Mobile': '?0',
-  'Sec-Ch-Ua-Platform': '"Windows"',
-  'Cache-Control': 'no-cache',
-};
-
-function tempoRelativo(dataStr) {
-  const diff = Date.now() - new Date(dataStr).getTime();
-  const min = Math.floor(diff / 60000);
-  const h = Math.floor(min / 60);
-  const d = Math.floor(h / 24);
-  if (d > 0) return `${d}d ago`;
-  if (h > 0) return `${h}h ago`;
-  return `${min}m ago`;
-}
-
-function diaDaPartida(dataObj) {
-  const d = Math.floor((Date.now() - dataObj.getTime()) / (1000 * 60 * 60 * 24));
-  if (d === 0) return 'Hoje';
-  if (d === 1) return 'Ontem';
-  return `${d} dias atrás`;
-}
-
-async function buscarPartidas(username) {
-  // URL exata que o tracker.gg usa internamente
-  const url = `https://api.tracker.gg/api/v2/r6siege/standard/matches/psn/${encodeURIComponent(username)}?gamemode=pvp_ranked`;
-  
-  console.log(`Buscando: ${url}`);
-  const resp = await fetch(url, { headers: HEADERS });
-  console.log(`Status: ${resp.status}`);
-  
-  if (!resp.ok) {
-    // Tenta sem filtro de gamemode
-    const url2 = `https://api.tracker.gg/api/v2/r6siege/standard/matches/psn/${encodeURIComponent(username)}`;
-    console.log(`Tentando sem filtro: ${url2}`);
-    const resp2 = await fetch(url2, { headers: HEADERS });
-    console.log(`Status 2: ${resp2.status}`);
-    if (!resp2.ok) throw new Error(`HTTP ${resp2.status}`);
-    return resp2.json();
-  }
-  return resp.json();
-}
-
-function processarPartidas(data, username) {
-  const matches = data?.data?.matches || data?.data?.items || data?.data || [];
-  
-  if (!Array.isArray(matches)) {
-    console.log('Formato inesperado:', JSON.stringify(data).slice(0, 200));
-    return [];
-  }
-
-  console.log(`${matches.length} partidas no total`);
-  const agora = Date.now();
-  const doisDias = 2 * 24 * 60 * 60 * 1000;
-
-  return matches
-    .map(match => {
-      const meta = match?.metadata || match?.attributes || {};
-      const segments = match?.segments || [];
-      
-      // Encontra stats do jogador dentro dos segments
-      const playerSeg = segments.find(s => 
-        s?.platformInfo?.platformUserHandle?.toLowerCase() === username.toLowerCase() ||
-        s?.attributes?.platformUserIdentifier?.toLowerCase() === username.toLowerCase()
-      ) || segments[0];
-
-      const stats = playerSeg?.stats || match?.stats || {};
-      const mapa = meta?.mapName || match?.mapName || meta?.map || 'Desconhecido';
-      const ts = meta?.completedAt || meta?.timestamp || match?.completedAt;
-      const dataObj = ts ? new Date(ts) : new Date();
-
-      if ((agora - dataObj.getTime()) > doisDias) return null;
-
-      const won = meta?.won ?? match?.won ?? playerSeg?.metadata?.won ?? stats?.won?.value;
-      const kills = parseInt(stats?.kills?.value ?? stats?.kills ?? 0) || 0;
-      const assists = parseInt(stats?.assists?.value ?? stats?.assists ?? 0) || 0;
-      const deaths = parseInt(stats?.deaths?.value ?? stats?.deaths ?? 0) || 0;
-
-      const rw = stats?.roundsWon?.value ?? meta?.roundsWon ?? 0;
-      const rl = stats?.roundsLost?.value ?? meta?.roundsLost ?? 0;
-      const placar = (rw || rl) ? `${rw}:${rl}` : '';
-
-      const badges = [];
-      if (parseInt(stats?.aces?.value || 0) > 0) badges.push('Ace');
-      if (parseInt(stats?.clutchWins?.value || stats?.clutches?.value || 0) > 0) badges.push('Clutch');
-
-      const chave = meta?.matchId || match?.id || match?.matchId || `${username}_${mapa}_${ts}`;
-      const dataStr = dataObj.toISOString().split('T')[0];
-
-      return {
-        chave,
-        matchId: chave,
-        mapa,
-        dia: diaDaPartida(dataObj),
-        tempoRelativo: tempoRelativo(dataObj.toISOString()),
-        data: dataStr,
-        resultado: won === true || won === 'true' ? 'win' : 'loss',
-        placar,
-        jogadores: [{ nome: username, kills, assists, deaths, badges }],
-        detectados: [username],
-      };
-    })
-    .filter(Boolean)
-    .slice(0, 15);
-}
-
-app.get('/sessao', async (req, res) => {
-  const ref = req.query.ref || JOGADORES_TIME[0];
-  const username = ref.split(',')[0].trim();
-
+// Cria tabela se não existir
+async function iniciarBanco() {
   try {
-    console.log(`\n=== Sessão para: ${username} ===`);
-    const data = await buscarPartidas(username);
-    const todasPartidas = processarPartidas(data, username);
-    console.log(`${todasPartidas.length} partidas nos últimos 2 dias`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS partidas (
+        id SERIAL PRIMARY KEY,
+        data DATE NOT NULL,
+        mapa VARCHAR(100),
+        resultado VARCHAR(10),
+        placar VARCHAR(20),
+        pontuacoes JSONB NOT NULL,
+        ts BIGINT NOT NULL,
+        criado_em TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log('Banco de dados pronto!');
+  } catch(e) {
+    console.error('Erro ao criar tabela:', e.message);
+  }
+}
 
-    // Cruza com outro jogador do time
-    if (todasPartidas.length > 0) {
-      for (const outro of JOGADORES_TIME.filter(j => j !== username).slice(0, 2)) {
-        try {
-          await new Promise(r => setTimeout(r, 600));
-          const dataOutro = await buscarPartidas(outro);
-          const partidasOutro = processarPartidas(dataOutro, outro);
-          todasPartidas.forEach(p => {
-            partidasOutro.forEach(po => {
-              const diff = Math.abs(new Date(p.data).getTime() - new Date(po.data).getTime());
-              if (p.mapa === po.mapa && diff <= 40 * 60 * 1000 && !p.detectados.includes(outro)) {
-                p.detectados.push(outro);
-                p.jogadores.push(...po.jogadores);
-              }
-            });
-          });
-        } catch(e) {
-          console.log(`Não cruzou ${outro}: ${e.message}`);
-        }
-      }
-    }
-
-    res.json({ sucesso: true, todasPartidas, ref: username });
-  } catch (e) {
-    console.error('Erro:', e.message);
+// GET /partidas — busca todas as partidas
+app.get('/partidas', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM partidas ORDER BY ts DESC');
+    const partidas = result.rows.map(r => ({
+      id: r.id,
+      data: r.data,
+      mapa: r.mapa,
+      resultado: r.resultado,
+      placar: r.placar,
+      pontuacoes: r.pontuacoes,
+      ts: parseInt(r.ts),
+    }));
+    res.json({ sucesso: true, partidas });
+  } catch(e) {
     res.status(500).json({ sucesso: false, erro: e.message });
   }
 });
 
-app.get('/', (req, res) => {
-  res.json({ status: 'online', versao: '9.0', jogadores: JOGADORES_TIME });
+// POST /partidas — salva uma partida
+app.post('/partidas', async (req, res) => {
+  const { data, mapa, resultado, placar, pontuacoes, ts } = req.body;
+  if (!data || !pontuacoes) {
+    return res.status(400).json({ sucesso: false, erro: 'Dados incompletos' });
+  }
+  try {
+    const result = await pool.query(
+      'INSERT INTO partidas (data, mapa, resultado, placar, pontuacoes, ts) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+      [data, mapa || '', resultado || '', placar || '', JSON.stringify(pontuacoes), ts || Date.now()]
+    );
+    res.json({ sucesso: true, id: result.rows[0].id });
+  } catch(e) {
+    res.status(500).json({ sucesso: false, erro: e.message });
+  }
 });
 
-app.listen(PORT, () => console.log(`Servidor v9 rodando na porta ${PORT}`));
+// DELETE /partidas/:id — apaga uma partida
+app.delete('/partidas/:id', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM partidas WHERE id = $1', [req.params.id]);
+    res.json({ sucesso: true });
+  } catch(e) {
+    res.status(500).json({ sucesso: false, erro: e.message });
+  }
+});
+
+// DELETE /partidas — apaga tudo
+app.delete('/partidas', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM partidas');
+    res.json({ sucesso: true });
+  } catch(e) {
+    res.status(500).json({ sucesso: false, erro: e.message });
+  }
+});
+
+// Health check
+app.get('/', (req, res) => {
+  res.json({ status: 'online', versao: '10.0', mensagem: 'IMB R6 Tracker — Banco de dados ativo!' });
+});
+
+iniciarBanco();
+app.listen(PORT, () => console.log(`Servidor v10 rodando na porta ${PORT}`));
