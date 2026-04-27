@@ -14,11 +14,15 @@ const JOGADORES_TIME = [
 ];
 
 const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept': 'application/json, text/html, */*;q=0.9',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+  'Accept': 'application/json, text/plain, */*',
   'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
   'Referer': 'https://r6.tracker.network/',
   'Origin': 'https://r6.tracker.network',
+  'X-Warden-Challenge-Passed': 'true',
+  'Sec-Ch-Ua': '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+  'Sec-Ch-Ua-Mobile': '?0',
+  'Sec-Ch-Ua-Platform': '"Windows"',
   'Cache-Control': 'no-cache',
 };
 
@@ -32,128 +36,124 @@ function tempoRelativo(dataStr) {
   return `${min}m ago`;
 }
 
-function diaDaPartida(dataStr) {
-  const diff = Date.now() - new Date(dataStr).getTime();
-  const d = Math.floor(diff / (1000 * 60 * 60 * 24));
+function diaDaPartida(dataObj) {
+  const d = Math.floor((Date.now() - dataObj.getTime()) / (1000 * 60 * 60 * 24));
   if (d === 0) return 'Hoje';
   if (d === 1) return 'Ontem';
   return `${d} dias atrás`;
 }
 
-async function buscarPartidasAPI(username) {
-  // Tenta API interna do tracker.gg (usada pelo site deles)
-  const urls = [
-    `https://api.tracker.gg/api/v2/r6siege/standard/profile/psn/${encodeURIComponent(username)}/segments/match?type=pvp_ranked`,
-    `https://api.tracker.gg/api/v2/r6siege/standard/profile/xbl/${encodeURIComponent(username)}/segments/match?type=pvp_ranked`,
-    `https://api.tracker.gg/api/v2/r6siege/standard/profile/pc/${encodeURIComponent(username)}/segments/match?type=pvp_ranked`,
-    // URL alternativa sem filtro de gamemode
-    `https://api.tracker.gg/api/v2/r6siege/standard/profile/psn/${encodeURIComponent(username)}/segments/match`,
-  ];
-
-  for (const url of urls) {
-    try {
-      console.log(`Tentando: ${url}`);
-      const resp = await fetch(url, { headers: HEADERS });
-      console.log(`Status: ${resp.status}`);
-      if (!resp.ok) continue;
-      const data = await resp.json();
-      const items = data?.data?.items || data?.data?.segments || data?.data || [];
-      if (Array.isArray(items) && items.length > 0) {
-        console.log(`Sucesso! ${items.length} partidas`);
-        return items;
-      }
-    } catch (e) {
-      console.log(`Erro em ${url}: ${e.message}`);
-    }
+async function buscarPartidas(username) {
+  // URL exata que o tracker.gg usa internamente
+  const url = `https://api.tracker.gg/api/v2/r6siege/standard/matches/psn/${encodeURIComponent(username)}?gamemode=pvp_ranked`;
+  
+  console.log(`Buscando: ${url}`);
+  const resp = await fetch(url, { headers: HEADERS });
+  console.log(`Status: ${resp.status}`);
+  
+  if (!resp.ok) {
+    // Tenta sem filtro de gamemode
+    const url2 = `https://api.tracker.gg/api/v2/r6siege/standard/matches/psn/${encodeURIComponent(username)}`;
+    console.log(`Tentando sem filtro: ${url2}`);
+    const resp2 = await fetch(url2, { headers: HEADERS });
+    console.log(`Status 2: ${resp2.status}`);
+    if (!resp2.ok) throw new Error(`HTTP ${resp2.status}`);
+    return resp2.json();
   }
-  return [];
+  return resp.json();
 }
 
-function processarItem(item, username) {
-  const meta = item?.metadata || item?.attributes || item || {};
-  const stats = item?.stats || {};
+function processarPartidas(data, username) {
+  const matches = data?.data?.matches || data?.data?.items || data?.data || [];
+  
+  if (!Array.isArray(matches)) {
+    console.log('Formato inesperado:', JSON.stringify(data).slice(0, 200));
+    return [];
+  }
 
-  const mapa = meta?.mapName || meta?.map || item?.mapName || 'Desconhecido';
-  const ts = meta?.timestamp || meta?.completedAt || item?.completedAt || item?.startedAt;
-  const dataObj = ts ? new Date(ts) : new Date();
-  const dataStr = dataObj.toISOString().split('T')[0];
+  console.log(`${matches.length} partidas no total`);
+  const agora = Date.now();
+  const doisDias = 2 * 24 * 60 * 60 * 1000;
 
-  // Filtra só últimos 2 dias
-  const diffDias = (Date.now() - dataObj.getTime()) / (1000 * 60 * 60 * 24);
-  if (diffDias > 2) return null;
+  return matches
+    .map(match => {
+      const meta = match?.metadata || match?.attributes || {};
+      const segments = match?.segments || [];
+      
+      // Encontra stats do jogador dentro dos segments
+      const playerSeg = segments.find(s => 
+        s?.platformInfo?.platformUserHandle?.toLowerCase() === username.toLowerCase() ||
+        s?.attributes?.platformUserIdentifier?.toLowerCase() === username.toLowerCase()
+      ) || segments[0];
 
-  const won = meta?.won ?? item?.won ?? stats?.won?.value;
-  const resultado = won === true || won === 'true' ? 'win' : 'loss';
+      const stats = playerSeg?.stats || match?.stats || {};
+      const mapa = meta?.mapName || match?.mapName || meta?.map || 'Desconhecido';
+      const ts = meta?.completedAt || meta?.timestamp || match?.completedAt;
+      const dataObj = ts ? new Date(ts) : new Date();
 
-  const kills = parseInt(stats?.kills?.value ?? stats?.kills ?? 0) || 0;
-  const assists = parseInt(stats?.assists?.value ?? stats?.assists ?? 0) || 0;
-  const deaths = parseInt(stats?.deaths?.value ?? stats?.deaths ?? 0) || 0;
+      if ((agora - dataObj.getTime()) > doisDias) return null;
 
-  const rw = stats?.roundsWon?.value ?? meta?.roundsWon ?? 0;
-  const rl = stats?.roundsLost?.value ?? meta?.roundsLost ?? 0;
-  const placar = (rw || rl) ? `${rw}:${rl}` : '';
+      const won = meta?.won ?? match?.won ?? playerSeg?.metadata?.won ?? stats?.won?.value;
+      const kills = parseInt(stats?.kills?.value ?? stats?.kills ?? 0) || 0;
+      const assists = parseInt(stats?.assists?.value ?? stats?.assists ?? 0) || 0;
+      const deaths = parseInt(stats?.deaths?.value ?? stats?.deaths ?? 0) || 0;
 
-  const badges = [];
-  if (parseInt(stats?.aces?.value || 0) > 0) badges.push('Ace');
-  if (parseInt(stats?.clutchWins?.value || stats?.clutches?.value || 0) > 0) badges.push('Clutch');
+      const rw = stats?.roundsWon?.value ?? meta?.roundsWon ?? 0;
+      const rl = stats?.roundsLost?.value ?? meta?.roundsLost ?? 0;
+      const placar = (rw || rl) ? `${rw}:${rl}` : '';
 
-  const chave = meta?.matchId || item?.id || `${username}_${mapa}_${ts}`;
+      const badges = [];
+      if (parseInt(stats?.aces?.value || 0) > 0) badges.push('Ace');
+      if (parseInt(stats?.clutchWins?.value || stats?.clutches?.value || 0) > 0) badges.push('Clutch');
 
-  return {
-    chave,
-    matchId: chave,
-    mapa,
-    dia: diaDaPartida(dataStr),
-    tempoRelativo: tempoRelativo(dataObj.toISOString()),
-    data: dataStr,
-    resultado,
-    placar,
-    jogadores: [{ nome: username, kills, assists, deaths, badges }],
-    detectados: [username],
-  };
+      const chave = meta?.matchId || match?.id || match?.matchId || `${username}_${mapa}_${ts}`;
+      const dataStr = dataObj.toISOString().split('T')[0];
+
+      return {
+        chave,
+        matchId: chave,
+        mapa,
+        dia: diaDaPartida(dataObj),
+        tempoRelativo: tempoRelativo(dataObj.toISOString()),
+        data: dataStr,
+        resultado: won === true || won === 'true' ? 'win' : 'loss',
+        placar,
+        jogadores: [{ nome: username, kills, assists, deaths, badges }],
+        detectados: [username],
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 15);
 }
 
 app.get('/sessao', async (req, res) => {
-  const ref = req.query.ref || req.query.jogadores || JOGADORES_TIME[0];
+  const ref = req.query.ref || JOGADORES_TIME[0];
   const username = ref.split(',')[0].trim();
 
   try {
-    console.log(`\n=== Buscando partidas de: ${username} ===`);
-    const items = await buscarPartidasAPI(username);
-
-    if (!items.length) {
-      return res.json({ sucesso: true, todasPartidas: [], mensagem: 'Nenhuma partida encontrada' });
-    }
-
-    const todasPartidas = items
-      .map(p => processarItem(p, username))
-      .filter(Boolean)
-      .slice(0, 15);
-
+    console.log(`\n=== Sessão para: ${username} ===`);
+    const data = await buscarPartidas(username);
+    const todasPartidas = processarPartidas(data, username);
     console.log(`${todasPartidas.length} partidas nos últimos 2 dias`);
 
-    // Tenta cruzar com 1 outro jogador do time para detectar squad
+    // Cruza com outro jogador do time
     if (todasPartidas.length > 0) {
-      const outro = JOGADORES_TIME.find(j => j !== username);
-      if (outro) {
+      for (const outro of JOGADORES_TIME.filter(j => j !== username).slice(0, 2)) {
         try {
-          await new Promise(r => setTimeout(r, 500));
-          const itemsOutro = await buscarPartidasAPI(outro);
-          const partidasOutro = itemsOutro.map(p => processarItem(p, outro)).filter(Boolean);
-          
+          await new Promise(r => setTimeout(r, 600));
+          const dataOutro = await buscarPartidas(outro);
+          const partidasOutro = processarPartidas(dataOutro, outro);
           todasPartidas.forEach(p => {
             partidasOutro.forEach(po => {
               const diff = Math.abs(new Date(p.data).getTime() - new Date(po.data).getTime());
-              if (p.mapa === po.mapa && diff <= 35 * 60 * 1000) {
-                if (!p.detectados.includes(outro)) {
-                  p.detectados.push(outro);
-                  p.jogadores.push(...po.jogadores);
-                }
+              if (p.mapa === po.mapa && diff <= 40 * 60 * 1000 && !p.detectados.includes(outro)) {
+                p.detectados.push(outro);
+                p.jogadores.push(...po.jogadores);
               }
             });
           });
         } catch(e) {
-          console.log(`Não cruzou com ${outro}: ${e.message}`);
+          console.log(`Não cruzou ${outro}: ${e.message}`);
         }
       }
     }
@@ -166,7 +166,7 @@ app.get('/sessao', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ status: 'online', versao: '8.0', mensagem: 'IMB R6 Tracker Server!', jogadores: JOGADORES_TIME });
+  res.json({ status: 'online', versao: '9.0', jogadores: JOGADORES_TIME });
 });
 
-app.listen(PORT, () => console.log(`Servidor v8 rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor v9 rodando na porta ${PORT}`));
