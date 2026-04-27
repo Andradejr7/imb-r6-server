@@ -1,16 +1,12 @@
 {
   "name": "imb-r6-server",
-  "version": "6.0.0",
-  "description": "IMB R6 Tracker Server",
+  "version": "10.0.0",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "pg": "^8.11.0"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  }
+  "engines": { "node": ">=18.0.0" }
 }
